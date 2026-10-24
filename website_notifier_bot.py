@@ -1,16 +1,15 @@
 """
-Telegram Website Post Notifier Bot (With In-Chat /seturl Command)
------------------------------------------------------------------
+Telegram Website Post Notifier Bot (With /seturl, /test, and /status)
+---------------------------------------------------------------------
 Features:
-  - Registers /seturl, /status, and /help in the Telegram command menu.
-  - Set or change the website URL anytime directly inside your Telegram chat
-    by sending: /seturl https://your-website.com
-  - Automatically strips accidental Markdown brackets if you paste a formatted link.
-  - Automatically tries RSS first; if the website does not have RSS, it
-    automatically falls back to smart HTML post detection.
-  - Saves both your current URL and seen posts inside `seen_posts.json`.
+  - /seturl https://your-website.com : Set or change the website URL in chat
+  - /test                            : Send a sample notification of the latest post
+  - /status                          : Check current monitored URL and post count
+  - Escapes HTML characters (&, <, >) in post titles so Telegram never rejects them.
+  - Remembers the exact chat_id where /seturl was sent.
 """
 
+import html
 import json
 import logging
 import os
@@ -29,7 +28,7 @@ from bs4 import BeautifulSoup
 # Only TELEGRAM_BOT_TOKEN is needed in GitHub Secrets!
 # ---------------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN_HERE").strip()
-TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "-5296495311")).strip()
+DEFAULT_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "-5296495311")).strip()
 
 RUN_ONCE = os.getenv("RUN_ONCE", "true").lower() == "true"
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "600"))
@@ -69,24 +68,29 @@ IGNORED_PATH_PARTS = (
 
 
 # ---------------------------------------------------------------------------
-# State Persistence (Stores target_url, last_update_id, and seen_posts)
+# State Persistence (Stores target_url, chat_id, last_update_id, seen_posts)
 # ---------------------------------------------------------------------------
 def load_state() -> Dict[str, Any]:
-    """Load bot state from seen_posts.json (supports legacy list format too)."""
+    """Load bot state from seen_posts.json (tolerates trailing commas in JSON)."""
     default_state = {
         "target_url": "",
+        "chat_id": DEFAULT_CHAT_ID,
         "last_update_id": 0,
         "seen_posts": [],
     }
     if STATE_FILE.exists():
         try:
-            raw = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            content = STATE_FILE.read_text(encoding="utf-8")
+            # Remove accidental trailing commas before ] or } if edited by hand
+            content = re.sub(r",\s*([\]}])", r"\1", content)
+            raw = json.loads(content)
             if isinstance(raw, list):
                 default_state["seen_posts"] = raw
                 return default_state
             if isinstance(raw, dict):
                 return {
                     "target_url": raw.get("target_url", ""),
+                    "chat_id": str(raw.get("chat_id") or DEFAULT_CHAT_ID),
                     "last_update_id": int(raw.get("last_update_id", 0)),
                     "seen_posts": list(raw.get("seen_posts", [])),
                 }
@@ -105,10 +109,11 @@ def save_state(state: Dict[str, Any]) -> None:
 # Telegram API Helpers
 # ---------------------------------------------------------------------------
 def register_bot_commands() -> None:
-    """Register slash commands with Telegram so they appear as clickable commands in groups."""
+    """Register slash commands with Telegram so they appear in the chat menu."""
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands"
     commands = [
         {"command": "seturl", "description": "Set website URL to monitor"},
+        {"command": "test", "description": "Send a test notification for the latest post"},
         {"command": "status", "description": "Show current monitored website"},
         {"command": "help", "description": "Show bot instructions"},
     ]
@@ -119,7 +124,7 @@ def register_bot_commands() -> None:
 
 
 def send_telegram_message(
-    text: str, disable_preview: bool = False, chat_id: str = TELEGRAM_CHAT_ID
+    text: str, disable_preview: bool = False, chat_id: str = DEFAULT_CHAT_ID
 ) -> None:
     """Send an HTML-formatted message to the Telegram chat."""
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -130,7 +135,21 @@ def send_telegram_message(
         "disable_web_page_preview": disable_preview,
     }
     resp = requests.post(api_url, json=payload, timeout=15)
+    if not resp.ok:
+        logger.error("Telegram API error (%s): %s", resp.status_code, resp.text)
     resp.raise_for_status()
+
+
+def format_post_notification(post: Dict[str, str], is_test: bool = False) -> str:
+    """Build a safe HTML notification string with escaped special characters."""
+    safe_title = html.escape(post["title"])
+    safe_url = html.escape(post["url"], quote=True)
+    heading = "<b>New Post Added! (Test Alert)</b>" if is_test else "<b>New Post Added!</b>"
+    return (
+        f"{heading}\n\n"
+        f"<b>Title:</b> {safe_title}\n"
+        f"<a href=\"{safe_url}\">Open Post</a>"
+    )
 
 
 def normalize_url(url_text: str) -> str:
@@ -188,7 +207,6 @@ def fetch_posts_via_html(site_url: str) -> List[Dict[str, str]]:
         posts: List[Dict[str, str]] = []
         seen_urls = set()
 
-        # Priority 1: Check common post card containers
         selectors = [
             "article a[href]",
             ".post a[href]",
@@ -202,7 +220,6 @@ def fetch_posts_via_html(site_url: str) -> List[Dict[str, str]]:
         for sel in selectors:
             candidate_links.extend(soup.select(sel))
 
-        # Priority 2: Fallback to all links on the page if none matched above
         if not candidate_links:
             candidate_links = soup.find_all("a", href=True)
 
@@ -214,7 +231,6 @@ def fetch_posts_via_html(site_url: str) -> List[Dict[str, str]]:
             full_url = urljoin(resp.url, raw_href)
             parsed = urlparse(full_url)
 
-            # Keep only links on the same domain (or subdomains) with a non-empty path
             if base_domain not in parsed.netloc or parsed.path in ("", "/"):
                 continue
 
@@ -223,7 +239,6 @@ def fetch_posts_via_html(site_url: str) -> List[Dict[str, str]]:
                 continue
 
             title = tag.get_text(" ", strip=True) or tag.get("title", "").strip()
-            # Filter out tiny nav buttons like "Home", "Next", "1", "2"
             if len(title) < 6 or full_url in seen_urls:
                 continue
 
@@ -246,10 +261,10 @@ def get_latest_posts(site_url: str) -> List[Dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
-# Process In-Chat Commands (/seturl, /status, /help)
+# Process In-Chat Commands (/seturl, /test, /status, /help)
 # ---------------------------------------------------------------------------
 def process_telegram_commands(state: Dict[str, Any]) -> None:
-    """Check recent messages in Telegram for /seturl or /status."""
+    """Check recent messages in Telegram for /seturl, /test, or /status."""
     register_bot_commands()
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
     params = {"offset": state["last_update_id"] + 1, "timeout": 5}
@@ -272,10 +287,13 @@ def process_telegram_commands(state: Dict[str, Any]) -> None:
         if not text.startswith("/"):
             continue
 
+        if chat_id:
+            state["chat_id"] = chat_id
+
         parts = text.split(maxsplit=1)
         cmd = parts[0].split("@")[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
-        reply_target = chat_id if chat_id else TELEGRAM_CHAT_ID
+        reply_target = state.get("chat_id") or DEFAULT_CHAT_ID
 
         if cmd == "/seturl":
             if not arg:
@@ -295,18 +313,40 @@ def process_telegram_commands(state: Dict[str, Any]) -> None:
 
             send_telegram_message(
                 f"<b>Website URL Updated!</b>\n\n"
-                f"<b>Monitoring:</b> {new_url}\n"
+                f"<b>Monitoring:</b> {html.escape(new_url)}\n"
                 f"<b>Existing posts saved:</b> {len(initial_posts)}\n"
                 f"You will now get notified here whenever a new post is added.",
                 disable_preview=True,
                 chat_id=reply_target,
             )
 
+        elif cmd == "/test":
+            target_url = state.get("target_url", "").strip()
+            if not target_url:
+                send_telegram_message(
+                    "No website URL set yet. Send <code>/seturl https://...</code> first.",
+                    disable_preview=True,
+                    chat_id=reply_target,
+                )
+                continue
+            posts = get_latest_posts(target_url)
+            if posts:
+                send_telegram_message(
+                    format_post_notification(posts[0], is_test=True),
+                    chat_id=reply_target,
+                )
+            else:
+                send_telegram_message(
+                    f"Could not find any posts on {html.escape(target_url)}.",
+                    disable_preview=True,
+                    chat_id=reply_target,
+                )
+
         elif cmd == "/status":
             current = state.get("target_url") or "Not set yet (use /seturl https://...)"
             send_telegram_message(
                 f"<b>Bot Status</b>\n\n"
-                f"<b>Current URL:</b> {current}\n"
+                f"<b>Current URL:</b> {html.escape(current)}\n"
                 f"<b>Tracked posts:</b> {len(state.get('seen_posts', []))}",
                 disable_preview=True,
                 chat_id=reply_target,
@@ -316,6 +356,7 @@ def process_telegram_commands(state: Dict[str, Any]) -> None:
             send_telegram_message(
                 "<b>Website Notifier Bot Commands</b>\n\n"
                 "• <code>/seturl https://website.com</code> — Set or change the website to monitor\n"
+                "• <code>/test</code> — Send a sample alert for the latest post\n"
                 "• <code>/status</code> — View current website and tracked post count",
                 disable_preview=True,
                 chat_id=reply_target,
@@ -341,6 +382,7 @@ def check_once(state: Dict[str, Any]) -> None:
         return
 
     seen_set = set(state.get("seen_posts", []))
+    notify_chat_id = state.get("chat_id") or DEFAULT_CHAT_ID
 
     if not seen_set:
         state["seen_posts"] = [p["id"] for p in latest_posts]
@@ -349,12 +391,13 @@ def check_once(state: Dict[str, Any]) -> None:
         return
 
     new_posts = [p for p in reversed(latest_posts) if p["id"] not in seen_set]
+    logger.info("Found %d new post(s) to notify.", len(new_posts))
+
     for post in new_posts:
         try:
             send_telegram_message(
-                f"<b>New Post Added!</b>\n\n"
-                f"<b>Title:</b> {post['title']}\n"
-                f"<a href=\"{post['url']}\">Open Post</a>"
+                format_post_notification(post, is_test=False),
+                chat_id=notify_chat_id,
             )
             seen_set.add(post["id"])
             state["seen_posts"].append(post["id"])
