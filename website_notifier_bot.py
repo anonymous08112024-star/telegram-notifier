@@ -1,12 +1,13 @@
 """
-Telegram Website Post Notifier Bot (With /seturl, /test, and /status)
----------------------------------------------------------------------
+Telegram Website Post Notifier Bot (Compact Alerts - Link Previews Disabled)
+----------------------------------------------------------------------------
 Features:
   - /seturl https://your-website.com : Set or change the website URL in chat
   - /test                            : Send a sample notification of the latest post
   - /status                          : Check current monitored URL and post count
-  - Escapes HTML characters (&, <, >) in post titles so Telegram never rejects them.
-  - Remembers the exact chat_id where /seturl was sent.
+  - Disables large link preview cards so notifications stay compact.
+  - Deduplicates URLs (strips trailing slashes and #fragments) to prevent
+    duplicate notifications for the same post.
 """
 
 import html
@@ -81,18 +82,24 @@ def load_state() -> Dict[str, Any]:
     if STATE_FILE.exists():
         try:
             content = STATE_FILE.read_text(encoding="utf-8")
-            # Remove accidental trailing commas before ] or } if edited by hand
             content = re.sub(r",\s*([\]}])", r"\1", content)
             raw = json.loads(content)
             if isinstance(raw, list):
-                default_state["seen_posts"] = raw
+                default_state["seen_posts"] = [
+                    u.split("#")[0].rstrip("/") for u in raw if isinstance(u, str)
+                ]
                 return default_state
             if isinstance(raw, dict):
+                seen = [
+                    u.split("#")[0].rstrip("/")
+                    for u in raw.get("seen_posts", [])
+                    if isinstance(u, str)
+                ]
                 return {
                     "target_url": raw.get("target_url", ""),
                     "chat_id": str(raw.get("chat_id") or DEFAULT_CHAT_ID),
                     "last_update_id": int(raw.get("last_update_id", 0)),
-                    "seen_posts": list(raw.get("seen_posts", [])),
+                    "seen_posts": seen,
                 }
         except (json.JSONDecodeError, OSError, ValueError) as exc:
             logger.warning("Could not read state file, starting fresh: %s", exc)
@@ -101,7 +108,7 @@ def load_state() -> Dict[str, Any]:
 
 def save_state(state: Dict[str, Any]) -> None:
     """Persist bot state to seen_posts.json (keeps latest 500 seen posts)."""
-    state["seen_posts"] = list(state.get("seen_posts", []))[-500:]
+    state["seen_posts"] = list(dict.fromkeys(state.get("seen_posts", [])))[-500:]
     STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
@@ -124,15 +131,16 @@ def register_bot_commands() -> None:
 
 
 def send_telegram_message(
-    text: str, disable_preview: bool = False, chat_id: str = DEFAULT_CHAT_ID
+    text: str, disable_preview: bool = True, chat_id: str = DEFAULT_CHAT_ID
 ) -> None:
-    """Send an HTML-formatted message to the Telegram chat."""
+    """Send an HTML-formatted message to Telegram with link previews disabled by default."""
     api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": disable_preview,
+        "link_preview_options": {"is_disabled": disable_preview},
     }
     resp = requests.post(api_url, json=payload, timeout=15)
     if not resp.ok:
@@ -141,7 +149,7 @@ def send_telegram_message(
 
 
 def format_post_notification(post: Dict[str, str], is_test: bool = False) -> str:
-    """Build a safe HTML notification string with escaped special characters."""
+    """Build a compact HTML notification string with escaped special characters."""
     safe_title = html.escape(post["title"])
     safe_url = html.escape(post["url"], quote=True)
     heading = "<b>New Post Added! (Test Alert)</b>" if is_test else "<b>New Post Added!</b>"
@@ -157,11 +165,11 @@ def normalize_url(url_text: str) -> str:
     url_text = url_text.strip()
     match = re.search(r"https?://[^\s\]\)]+", url_text)
     if match:
-        return match.group(0).rstrip("/")
+        return match.group(0).split("#")[0].rstrip("/")
     url_text = url_text.strip("[]()")
     if not url_text.startswith(("http://", "https://")):
         url_text = "https://" + url_text
-    return url_text.rstrip("/")
+    return url_text.split("#")[0].rstrip("/")
 
 
 # ---------------------------------------------------------------------------
@@ -183,10 +191,12 @@ def fetch_posts_via_rss(site_url: str) -> List[Dict[str, str]]:
             if not feed.entries:
                 continue
             posts = []
+            seen_urls = set()
             for entry in feed.entries:
                 title = entry.get("title", "").strip()
-                link = entry.get("link", "").strip()
-                if title and link:
+                link = entry.get("link", "").strip().split("#")[0].rstrip("/")
+                if title and link and link not in seen_urls:
+                    seen_urls.add(link)
                     posts.append({"id": link, "title": title, "url": link})
             if posts:
                 logger.info("Fetched %d posts via RSS (%s)", len(posts), rss_url)
@@ -197,7 +207,7 @@ def fetch_posts_via_rss(site_url: str) -> List[Dict[str, str]]:
 
 
 def fetch_posts_via_html(site_url: str) -> List[Dict[str, str]]:
-    """Smart HTML parser that works on almost any blog/media website."""
+    """Smart HTML parser that deduplicates links pointing to the same post."""
     try:
         resp = requests.get(site_url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
@@ -228,7 +238,7 @@ def fetch_posts_via_html(site_url: str) -> List[Dict[str, str]]:
             if not raw_href or raw_href.startswith("#"):
                 continue
 
-            full_url = urljoin(resp.url, raw_href)
+            full_url = urljoin(resp.url, raw_href).split("#")[0].rstrip("/")
             parsed = urlparse(full_url)
 
             if base_domain not in parsed.netloc or parsed.path in ("", "/"):
@@ -278,6 +288,8 @@ def process_telegram_commands(state: Dict[str, Any]) -> None:
         logger.warning("Could not fetch Telegram updates: %s", exc)
         return
 
+    processed_commands = set()
+
     for update in updates:
         state["last_update_id"] = max(state["last_update_id"], update["update_id"])
         msg = update.get("message") or update.get("channel_post") or {}
@@ -295,12 +307,17 @@ def process_telegram_commands(state: Dict[str, Any]) -> None:
         arg = parts[1].strip() if len(parts) > 1 else ""
         reply_target = state.get("chat_id") or DEFAULT_CHAT_ID
 
+        # Avoid running the exact same command twice in a single workflow run
+        cmd_key = f"{cmd}:{arg}"
+        if cmd_key in processed_commands:
+            continue
+        processed_commands.add(cmd_key)
+
         if cmd == "/seturl":
             if not arg:
                 send_telegram_message(
                     "Please provide a URL after the command.\n"
                     "Example:\n<code>/seturl https://example.com</code>",
-                    disable_preview=True,
                     chat_id=reply_target,
                 )
                 continue
@@ -316,7 +333,6 @@ def process_telegram_commands(state: Dict[str, Any]) -> None:
                 f"<b>Monitoring:</b> {html.escape(new_url)}\n"
                 f"<b>Existing posts saved:</b> {len(initial_posts)}\n"
                 f"You will now get notified here whenever a new post is added.",
-                disable_preview=True,
                 chat_id=reply_target,
             )
 
@@ -325,7 +341,6 @@ def process_telegram_commands(state: Dict[str, Any]) -> None:
             if not target_url:
                 send_telegram_message(
                     "No website URL set yet. Send <code>/seturl https://...</code> first.",
-                    disable_preview=True,
                     chat_id=reply_target,
                 )
                 continue
@@ -338,7 +353,6 @@ def process_telegram_commands(state: Dict[str, Any]) -> None:
             else:
                 send_telegram_message(
                     f"Could not find any posts on {html.escape(target_url)}.",
-                    disable_preview=True,
                     chat_id=reply_target,
                 )
 
@@ -348,7 +362,6 @@ def process_telegram_commands(state: Dict[str, Any]) -> None:
                 f"<b>Bot Status</b>\n\n"
                 f"<b>Current URL:</b> {html.escape(current)}\n"
                 f"<b>Tracked posts:</b> {len(state.get('seen_posts', []))}",
-                disable_preview=True,
                 chat_id=reply_target,
             )
 
@@ -358,7 +371,6 @@ def process_telegram_commands(state: Dict[str, Any]) -> None:
                 "• <code>/seturl https://website.com</code> — Set or change the website to monitor\n"
                 "• <code>/test</code> — Send a sample alert for the latest post\n"
                 "• <code>/status</code> — View current website and tracked post count",
-                disable_preview=True,
                 chat_id=reply_target,
             )
 
