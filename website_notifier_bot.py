@@ -1,13 +1,16 @@
 """
-Telegram Website Post Notifier Bot (Compact Alerts - Link Previews Disabled)
-----------------------------------------------------------------------------
+Telegram Website Post Notifier Bot (Priority Highlights for 2026 & WEB-DL)
+--------------------------------------------------------------------------
 Features:
   - /seturl https://your-website.com : Set or change the website URL in chat
   - /test                            : Send a sample notification of the latest post
   - /status                          : Check current monitored URL and post count
-  - Disables large link preview cards so notifications stay compact.
-  - Deduplicates URLs (strips trailing slashes and #fragments) to prevent
-    duplicate notifications for the same post.
+  - Tiered visual priority banners:
+      * 🚨 TOP PRIORITY: 2026 + WEB-DL releases
+      * 🔥 LATEST RELEASE: 2026 releases
+      * 📢 Standard posts: Older years or standard uploads
+  - Compact notifications (link previews disabled).
+  - Deduplicates URLs to prevent duplicate alerts.
 """
 
 import html
@@ -149,15 +152,48 @@ def send_telegram_message(
 
 
 def format_post_notification(post: Dict[str, str], is_test: bool = False) -> str:
-    """Build a compact HTML notification string with escaped special characters."""
+    """
+    Build a compact HTML notification with visual priority recognition:
+      - Top Priority : 2026 + WEB-DL release
+      - High Priority: 2026 release
+      - Standard     : Regular upload
+    """
     safe_title = html.escape(post["title"])
     safe_url = html.escape(post["url"], quote=True)
-    heading = "<b>New Post Added! (Test Alert)</b>" if is_test else "<b>New Post Added!</b>"
-    return (
-        f"{heading}\n\n"
-        f"<b>Title:</b> {safe_title}\n"
-        f"<a href=\"{safe_url}\">Open Post</a>"
-    )
+
+    title_text = post["title"]
+    has_2026 = bool(re.search(r"\b2026\b", title_text))
+    has_webdl = bool(re.search(r"\bWEB-?DL\b", title_text, re.IGNORECASE))
+
+    test_prefix = "<b>[TEST ALERT]</b>\n" if is_test else ""
+
+    if has_2026 and has_webdl:
+        banner = (
+            f"{test_prefix}"
+            f"🚨 <b>TOP PRIORITY: 2026 WEB-DL</b> 🚨\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"⭐ <b>Tags:</b> <code>2026</code> • <code>WEB-DL</code>\n\n"
+            f"<b>Title:</b> {safe_title}\n"
+            f"<a href=\"{safe_url}\">Open Post</a>"
+        )
+    elif has_2026:
+        banner = (
+            f"{test_prefix}"
+            f"🔥 <b>LATEST 2026 RELEASE</b> 🔥\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 <b>Year:</b> <code>2026</code>\n\n"
+            f"<b>Title:</b> {safe_title}\n"
+            f"<a href=\"{safe_url}\">Open Post</a>"
+        )
+    else:
+        banner = (
+            f"{test_prefix}"
+            f"📢 <b>New Post Added</b>\n\n"
+            f"<b>Title:</b> {safe_title}\n"
+            f"<a href=\"{safe_url}\">Open Post</a>"
+        )
+
+    return banner
 
 
 def normalize_url(url_text: str) -> str:
@@ -307,7 +343,6 @@ def process_telegram_commands(state: Dict[str, Any]) -> None:
         arg = parts[1].strip() if len(parts) > 1 else ""
         reply_target = state.get("chat_id") or DEFAULT_CHAT_ID
 
-        # Avoid running the exact same command twice in a single workflow run
         cmd_key = f"{cmd}:{arg}"
         if cmd_key in processed_commands:
             continue
@@ -361,7 +396,8 @@ def process_telegram_commands(state: Dict[str, Any]) -> None:
             send_telegram_message(
                 f"<b>Bot Status</b>\n\n"
                 f"<b>Current URL:</b> {html.escape(current)}\n"
-                f"<b>Tracked posts:</b> {len(state.get('seen_posts', []))}",
+                f"<b>Tracked posts:</b> {len(state.get('seen_posts', []))}\n"
+                f"<b>Priority Highlight:</b> 2026 + WEB-DL",
                 chat_id=reply_target,
             )
 
